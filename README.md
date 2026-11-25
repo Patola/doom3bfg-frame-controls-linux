@@ -38,13 +38,16 @@ Play **Doom 3 BFG Edition: Fully Possessed** with native Steam Frame controllers
 | Right Y | Open PDA | |
 | Right A / B | Use / pause | |
 | Left / right stick click | Sprint / teleport | |
-| Trigger / grip | | Select / go back |
+| Right grip | Swap weapons at the right hip holster | Go back |
+| Trigger / left grip | | Select / go back |
 
 If you use WayVR, hold View or Menu before tapping the bumper on the same controller to use its existing shortcuts.
 
 ### A weapon is missing from the cycle
 
-Fully Possessed omits the weapon in the hip holster when cycling in either direction. A holstered machine gun can still be equipped through **PDA → Inventory**. Check the hip holster and draw the weapon from there. As a diagnostic, `vr_slotDisable 1` in Doom’s console disables the body slots and clears the active holster entry. Set it back to `0` to re-enable the slots. Reload a save from before the test to recover its holster state. [Fully Possessed weapon cycling code](https://github.com/NPi2Loup/DOOM-3-BFG-VR/blob/v0.021j-Alpha/neo/d3xp/Player.cpp#L6415-L6535)
+Fully Possessed omits the weapon in the hip holster when cycling in either direction. With the PDA closed and the default right-handed setup, bring your **right controller to your right hip**. Release the grip if it’s already pressed, then squeeze the **right grip button** once while the controller is at your hip. This swaps the weapon in your hand with the holstered weapon. You may feel a short buzz when the controller enters the holster area. You can also equip the weapon through **PDA → Inventory**.
+
+As a diagnostic, `vr_slotDisable 1` in Doom’s console disables the body slots and clears the active holster entry. Set it back to `0` to re-enable the slots. Reload a save from before the test to recover its holster state. [Fully Possessed weapon cycling code](https://github.com/NPi2Loup/DOOM-3-BFG-VR/blob/v0.021j-Alpha/neo/d3xp/Player.cpp#L6415-L6535)
 
 ## Build from source
 
