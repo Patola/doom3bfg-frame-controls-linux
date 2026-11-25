@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+install_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+command=("$@")
+for index in "${!command[@]}"; do
+    if [[ ${command[index]} == */Doom3BFG.exe ]]; then
+        command[index]="${command[index]%/*}/Doom3BFGVR.exe"
+        export VR_OVERRIDE="$install_dir/xrizer"
+        export XRIZER_DOOM3_FRAME_CONTROLS=1
+        export XRIZER_DOOM3_FRAME_EQUIP="$install_dir/equip-state"
+        windows_path=$(printf '%s' "$XRIZER_DOOM3_FRAME_EQUIP" | tr '/' '\\')
+        export DOOM3_FRAME_XINPUT_STATE="Z:$windows_path"
+        export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+${WINEDLLOVERRIDES};}xinput1_3=n,b"
+        umask 077
+        printf '\000' > "$XRIZER_DOOM3_FRAME_EQUIP"
+        exec "${command[@]}" +exec doom3_frame.cfg > "$install_dir/doom3-console.log" 2>&1
+    fi
+done
+printf '%s\n' 'Doom 3 Frame launcher could not find Doom3BFG.exe in the Steam command.' >&2
+exit 1

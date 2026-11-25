@@ -1,0 +1,576 @@
+diff --git a/src/clientcore.rs b/src/clientcore.rs
+index 1590702..80a0769 100644
+--- a/src/clientcore.rs
++++ b/src/clientcore.rs
+@@ -189,11 +189,26 @@ impl IVRClientCore003_Interface for ClientCore {
+         }
+     }
+     fn Cleanup(&self) {
+-        self.interface_store.lock().unwrap().clear();
++        let trace = std::env::var_os("XRIZER_DOOM3_FRAME_CONTROLS").is_some();
++        if trace {
++            info!("Doom 3 entered OpenVR cleanup");
++        }
++
++        // The runtime can call back into Cleanup while destroying the session.
++        let openxr = self.openxr.write().unwrap().take();
++        let Some(openxr) = openxr else {
++            if trace {
++                info!("Doom 3 skipped duplicate OpenVR cleanup");
++            }
++            return;
++        };
+ 
+-        let mut openxr = self.openxr.write().unwrap();
+-        assert_eq!(Arc::strong_count(openxr.as_ref().unwrap()), 1);
+-        openxr.take();
++        self.interface_store.lock().unwrap().clear();
++        assert_eq!(Arc::strong_count(&openxr), 1);
++        drop(openxr);
++        if trace {
++            info!("Doom 3 finished OpenVR cleanup");
++        }
+     }
+     fn GetIDForVRInitError(&self, _: vr::EVRInitError) -> *const c_char {
+         std::ptr::null()
+@@ -369,6 +384,13 @@ mod tests {
+     interface!(Interface2(Injected<Interface1>), c"two");
+     interface!(Interface3(Injected<Interface1>), c"three");
+     interface!(Interface4(Injected<Interface1>), c"four");
++    interface!(CleanupCallback(Weak<ClientCore>), c"cleanup_callback");
++
++    impl Drop for CleanupCallback {
++        fn drop(&mut self) {
++            self.0.upgrade().unwrap().Cleanup();
++        }
++    }
+ 
+     impl<T: std::fmt::Debug + InterfaceImpl> std::fmt::Debug for Injected<T> {
+         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+@@ -383,11 +405,13 @@ mod tests {
+     #[test]
+     fn restart() {
+         let core = ClientCore::new(c"IVRClientCore_003").unwrap();
+-        core.clone()
+-            .Init(vr::EVRApplicationType::Scene, std::ptr::null());
++        let init = || core.Init(vr::EVRApplicationType::Scene, std::ptr::null());
++        assert_eq!(init(), vr::EVRInitError::None);
++        core.try_interface(c"cleanup_callback", |_| {
++            CleanupCallback(Arc::downgrade(&core))
++        });
+         core.clone().Cleanup();
+-        core.clone()
+-            .Init(vr::EVRApplicationType::Scene, std::ptr::null());
++        assert_eq!(init(), vr::EVRInitError::None);
+     }
+ 
+     #[test]
+diff --git a/src/input.rs b/src/input.rs
+index 4fe2507..ea02707 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -3,6 +3,7 @@ mod custom_bindings;
+ mod devices;
+ mod legacy;
+ mod profiles;
++pub(crate) use profiles::frame_controller::EXTENSION as FRAME_CONTROLLER_EXTENSION;
+ mod skeletal;
+ 
+ #[cfg(test)]
+diff --git a/src/input/devices.rs b/src/input/devices.rs
+index bdd9e70..3407289 100644
+--- a/src/input/devices.rs
++++ b/src/input/devices.rs
+@@ -58,6 +58,7 @@ pub struct ProfileData {
+     /// or thumbstick is being touched, so just use the skeletal input actions to
+     /// determine the curl value for the thumb.
+     pub force_estimated_thumb: bool,
++    frame_dpad: bool,
+ }
+ 
+ impl ProfileData {
+@@ -66,6 +67,8 @@ impl ProfileData {
+             properties: P::properties(),
+             get_hand_offset: P::offset_grip_pose,
+             force_estimated_thumb: TypeId::of::<P>() == TypeId::of::<Knuckles>(),
++            frame_dpad: TypeId::of::<P>()
++                == TypeId::of::<super::profiles::frame_controller::FrameController>(),
+         }
+     }
+ 
+@@ -285,7 +288,8 @@ impl TrackedDevice {
+     fn get_int_property(&self, property: vr::ETrackedDeviceProperty) -> Option<i32> {
+         match self.device_type {
+             TrackedDeviceType::Controller { .. } => {
+-                let data = self.profile_data.as_ref()?.properties;
++                let profile = self.profile_data.as_ref()?;
++                let data = profile.properties;
+ 
+                 match property {
+                     vr::ETrackedDeviceProperty::Axis0Type_Int32 => match data.main_axis {
+@@ -299,6 +303,9 @@ impl TrackedDevice {
+                         // This is actually the grip, and gets recognized as such
+                         Some(vr::EVRControllerAxisType::Trigger as _)
+                     }
++                    vr::ETrackedDeviceProperty::Axis3Type_Int32 if profile.frame_dpad => {
++                        Some(vr::EVRControllerAxisType::TrackPad as _)
++                    }
+                     // TODO: report knuckles trackpad?
+                     vr::ETrackedDeviceProperty::Axis3Type_Int32
+                     | vr::ETrackedDeviceProperty::Axis4Type_Int32 => {
+diff --git a/src/input/legacy.rs b/src/input/legacy.rs
+index 3099735..7eda1e8 100644
+--- a/src/input/legacy.rs
++++ b/src/input/legacy.rs
+@@ -2,13 +2,15 @@ use super::{Input, PoseData, WriteOnDrop};
+ use crate::{
+     input::{
+         LoadedActions, ManifestLoadedActions,
+-        profiles::{self, RunWithProfile},
++        profiles::{self, InteractionProfile, RunWithProfile, frame_controller::FrameController},
+     },
+-    openxr_data::{self},
++    openxr_data::{self, Hand},
+ };
+ use log::{debug, trace, warn};
+ use openvr as vr;
+ use openxr as xr;
++use std::fs::{File, OpenOptions};
++use std::os::unix::fs::FileExt;
+ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ 
+ #[derive(Default)]
+@@ -47,6 +49,7 @@ impl<C: openxr_data::Compositor> Input<C> {
+             &self.openxr.instance,
+             self.subaction_paths.left,
+             self.subaction_paths.right,
++            FrameController::has_required_extensions(&self.openxr.enabled_extensions),
+         );
+         let input_data = &session_data.input_data;
+ 
+@@ -70,21 +73,29 @@ impl<C: openxr_data::Compositor> Input<C> {
+ 
+                 let conv = super::profiles::InputToXrPath::new(&self.openxr.instance);
+                 let bindings = P::legacy_bindings(&conv);
+-                self.openxr
+-                    .instance
+-                    .suggest_interaction_profile_bindings(
+-                        self.openxr
+-                            .instance
+-                            .string_to_path(P::profile_path())
+-                            .unwrap(),
+-                        &bindings
+-                            .into_iter(
+-                                &self.legacy.actions,
+-                                self.input_data.pose_data.get().unwrap(),
+-                            )
+-                            .collect::<Vec<_>>(),
++                let instance = &self.openxr.instance;
++                let mut bindings: Vec<_> = bindings
++                    .into_iter(
++                        &self.legacy.actions,
++                        self.input_data.pose_data.get().unwrap(),
+                     )
+-                    .unwrap();
++                    .collect();
++                if P::profile_path() == FrameController::profile_path()
++                    && let Some(frame) = &self.legacy.frame
++                {
++                    frame.add_bindings(instance, &mut bindings);
++                }
++                let result = instance.suggest_interaction_profile_bindings(
++                    instance.string_to_path(P::profile_path()).unwrap(),
++                    &bindings,
++                );
++                if P::profile_path() == FrameController::profile_path() {
++                    if let Err(error) = result {
++                        warn!("Doom 3 Frame bindings rejected: {error:?}");
++                    }
++                } else {
++                    result.unwrap();
++                }
+             }
+         }
+ 
+@@ -296,6 +307,10 @@ impl<C: openxr_data::Compositor> Input<C> {
+             y: 0.0,
+         };
+ 
++        if let Some(frame) = &legacy.frame {
++            frame.apply(&data.session, hand_path, hand, state);
++        }
++
+         true
+     }
+ }
+@@ -382,13 +397,145 @@ impl LegacyBindings {
+     }
+ }
+ 
++// Fully Possessed polls legacy controller state. It reads trackpad axes for PDA
++// navigation and recognizes raw button bits 8-15 as additional bindable keys.
++struct DoomFrameActions {
++    buttons: [xr::Action<bool>; Self::BINDINGS.len()],
++    equip_state: Option<File>,
++    last_equip: AtomicBool,
++}
++
++impl DoomFrameActions {
++    const BINDINGS: [(&str, &str, &str); 10] = [
++        ("dpad-up", "/user/hand/left/input/dpad_up/click", ""),
++        ("dpad-down", "/user/hand/left/input/dpad_down/click", ""),
++        ("dpad-left", "/user/hand/left/input/dpad_left/click", ""),
++        ("dpad-right", "/user/hand/left/input/dpad_right/click", ""),
++        (
++            "bumper",
++            "/user/hand/left/input/bumper/click",
++            "/user/hand/right/input/bumper/click",
++        ),
++        (
++            "overlay-modifier",
++            "/user/hand/left/input/view/click",
++            "/user/hand/right/input/menu/click",
++        ),
++        (
++            "frame-stick-click",
++            "/user/hand/left/input/thumbstick/click",
++            "/user/hand/right/input/thumbstick/click",
++        ),
++        ("frame-b", "", "/user/hand/right/input/b/click"),
++        ("frame-x", "", "/user/hand/right/input/x/click"),
++        ("frame-y", "", "/user/hand/right/input/y/click"),
++    ];
++
++    fn new(set: &xr::ActionSet, subactions: &[xr::Path; 2]) -> Self {
++        Self {
++            buttons: Self::BINDINGS
++                .map(|(name, _, _)| set.create_action(name, name, subactions).unwrap()),
++            equip_state: std::env::var_os("XRIZER_DOOM3_FRAME_EQUIP")
++                .and_then(|path| OpenOptions::new().write(true).open(path).ok()),
++            last_equip: AtomicBool::new(false),
++        }
++    }
++
++    fn add_bindings<'a>(&'a self, instance: &xr::Instance, bindings: &mut Vec<xr::Binding<'a>>) {
++        for (button, (_, left, right)) in self.buttons.iter().zip(Self::BINDINGS) {
++            for path in [left, right].into_iter().filter(|path| !path.is_empty()) {
++                bindings.push(xr::Binding::new(
++                    button,
++                    instance.string_to_path(path).unwrap(),
++                ));
++            }
++        }
++    }
++
++    fn apply(
++        &self,
++        session: &xr::Session<xr::AnyGraphics>,
++        path: xr::Path,
++        hand: Hand,
++        state: &mut vr::VRControllerState_t,
++    ) {
++        let [
++            up,
++            down,
++            left,
++            right,
++            bumper,
++            overlay_modifier,
++            stick_click,
++            b,
++            x,
++            y,
++        ] = self.buttons.each_ref().map(|button| {
++            button
++                .state(session, path)
++                .is_ok_and(|value| value.is_active && value.current_state)
++        });
++        if hand == Hand::Left {
++            state.rAxis[3] = vr::VRControllerAxis_t {
++                x: (right as i32 - left as i32) as f32,
++                y: (up as i32 - down as i32) as f32,
++            };
++        }
++        // The mod's PDA treats legacy menu click as the previous tab and pad
++        // click as the next tab. View/Menu + Bumper remains available to WayVR.
++        if bumper && !overlay_modifier {
++            let id = match hand {
++                Hand::Left => vr::EVRButtonId::ApplicationMenu,
++                Hand::Right => vr::EVRButtonId::Axis0,
++            };
++            state.ulButtonPressed |= button_mask_from_id(id);
++        }
++        match hand {
++            Hand::Left => state.ulButtonPressed |= (stick_click as u64) << 8,
++            Hand::Right => {
++                state.ulButtonPressed |= (b as u64) << 8;
++                if !self.publish_equip(x) {
++                    state.ulButtonPressed |= (x as u64) << 9;
++                }
++                state.ulButtonPressed |= (y as u64) << 10;
++                state.ulButtonPressed |= (stick_click as u64) << 11;
++            }
++        }
++    }
++
++    fn publish_equip(&self, pressed: bool) -> bool {
++        let Some(file) = &self.equip_state else {
++            return false;
++        };
++        if self.last_equip.load(Ordering::Relaxed) != pressed {
++            if !matches!(file.write_at(&[u8::from(pressed)], 0), Ok(1)) {
++                return false;
++            }
++            self.last_equip.store(pressed, Ordering::Relaxed);
++        }
++        true
++    }
++}
++
++impl Drop for DoomFrameActions {
++    fn drop(&mut self) {
++        let _ = self.publish_equip(false);
++    }
++}
++
+ pub(super) struct LegacyActionData {
+     pub set: xr::ActionSet,
+     actions: LegacyActions,
++    frame: Option<DoomFrameActions>,
+ }
+ 
+ impl LegacyActionData {
+-    pub fn new(instance: &xr::Instance, left_hand: xr::Path, right_hand: xr::Path) -> Self {
++    pub fn new(
++        instance: &xr::Instance,
++        left_hand: xr::Path,
++        right_hand: xr::Path,
++        frame_enabled: bool,
++    ) -> Self {
+         debug!("creating legacy actions");
+         let leftright = [left_hand, right_hand];
+ 
+@@ -422,7 +569,12 @@ impl LegacyActionData {
+             extra: Actions,
+         };
+ 
+-        Self { set, actions }
++        let frame = frame_enabled.then(|| DoomFrameActions::new(&set, &leftright));
++        Self {
++            set,
++            actions,
++            frame,
++        }
+     }
+ }
+ 
+@@ -471,6 +623,71 @@ mod tests {
+         verify_offset!(data, data);
+     };
+ 
++    #[test]
++    fn doom_frame_dpad_and_buttons() {
++        use crate::input::profiles::{InteractionProfile, frame_controller::FrameController};
++        use fakexr::UserPath::{LeftHand, RightHand};
++
++        let mut f = Fixture::new();
++        f.set_interaction_profile::<FrameController>(LeftHand);
++        f.set_interaction_profile::<FrameController>(RightHand);
++        let instance = &f.input.openxr.instance;
++        let data = f.input.openxr.session_data.get();
++        let left = f.input.get_subaction_path(Hand::Left);
++        let right = f.input.get_subaction_path(Hand::Right);
++        let legacy = super::LegacyActionData::new(instance, left, right, true);
++        let frame = legacy.frame.as_ref().unwrap();
++        let mut bindings = Vec::new();
++        frame.add_bindings(instance, &mut bindings);
++        let profile = instance
++            .string_to_path(FrameController::profile_path())
++            .unwrap();
++        instance
++            .suggest_interaction_profile_bindings(profile, &bindings)
++            .unwrap();
++        data.session.attach_action_sets(&[&legacy.set]).unwrap();
++
++        let [up, _, _, dpad_right, bumper, modifier, stick, b, x, y] = &frame.buttons;
++        assert_eq!(
++            fakexr::get_suggested_bindings(up.as_raw(), profile),
++            ["/user/hand/left/input/dpad_up/click"],
++        );
++        for action in [up, dpad_right, bumper, modifier] {
++            fakexr::set_action_state(action.as_raw(), true.into(), LeftHand);
++        }
++        for action in [bumper, stick, b, x, y] {
++            fakexr::set_action_state(action.as_raw(), true.into(), RightHand);
++        }
++        let sync = || {
++            data.session
++                .sync_actions(&[xr::ActiveActionSet::new(&legacy.set)])
++                .unwrap()
++        };
++        sync();
++
++        let mut state = vr::VRControllerState_t::default();
++        state.rAxis[0].x = 0.25;
++        frame.apply(&data.session, left, Hand::Left, &mut state);
++        assert_eq!(state.rAxis[0].x, 0.25);
++        assert_eq!((state.rAxis[3].x, state.rAxis[3].y), (1.0, 1.0));
++        let left_tab = super::button_mask_from_id(vr::EVRButtonId::ApplicationMenu);
++        let right_tab = super::button_mask_from_id(vr::EVRButtonId::Axis0);
++        assert_eq!(state.ulButtonPressed & left_tab, 0);
++
++        fakexr::set_action_state(modifier.as_raw(), false.into(), LeftHand);
++        sync();
++        frame.apply(&data.session, left, Hand::Left, &mut state);
++        assert_eq!(state.ulButtonPressed & left_tab, left_tab);
++
++        let mut state = vr::VRControllerState_t::default();
++        frame.apply(&data.session, right, Hand::Right, &mut state);
++        let pressed = state.ulButtonPressed;
++        assert_eq!(
++            pressed,
++            right_tab | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11)
++        );
++    }
++
+     #[test]
+     fn no_legacy_input_before_session_setup() {
+         let fixture = Fixture::new();
+diff --git a/src/input/profiles.rs b/src/input/profiles.rs
+index d929080..d4f287a 100644
+--- a/src/input/profiles.rs
++++ b/src/input/profiles.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod frame_controller;
+ pub mod knuckles;
+ pub mod meta_touch_plus;
+ pub mod oculus_touch;
+@@ -94,6 +95,7 @@ pub fn run_for_all_profiles(runner: &mut impl RunWithProfile) {
+     profile!(Knuckles);
+     profile!(MetaTouchPlus);
+     profile!(OculusTouch);
++    profile!(frame_controller::FrameController);
+     profile!(ViveFocus3);
+     profile!(SimpleController);
+ }
+diff --git a/src/input/profiles/frame_controller.rs b/src/input/profiles/frame_controller.rs
+new file mode 100644
+index 0000000..8540cd3
+--- /dev/null
++++ b/src/input/profiles/frame_controller.rs
+@@ -0,0 +1,94 @@
++use super::{
++    InputToXrPath, InteractionProfile, MainAxisType, ProfileProperties, Property,
++    SkeletalInputBindings, legal_paths, oculus_touch::OculusTouch, paths::*,
++};
++use crate::input::legacy::{self, LegacyBindings};
++use crate::openxr_data::Hand;
++use glam::Mat4;
++use openxr as xr;
++
++pub(crate) const EXTENSION: &[u8] = b"XR_VALVE_frame_controller_interaction\0";
++
++pub(crate) struct FrameController;
++
++impl InteractionProfile for FrameController {
++    type LegalPaths = legal_paths![
++        Both::<
++            (Squeeze, Value),
++            (Trigger, Value),
++            (Trigger, Touch),
++            (Thumbstick, ()),
++            (Thumbstick, Click),
++            (Thumbstick, Touch),
++        >,
++        Right::<(A, Click), (A, Touch), (B, Click), (B, Touch)>
++    ];
++
++    fn profile_path() -> &'static str {
++        "/interaction_profiles/valve/frame_controller_valve"
++    }
++
++    fn has_required_extensions(extensions: &xr::ExtensionSet) -> bool {
++        extensions.other.iter().any(|name| name == EXTENSION)
++    }
++
++    fn properties() -> &'static ProfileProperties {
++        static PROPERTIES: ProfileProperties = ProfileProperties {
++            model: Property::PerHand {
++                left: c"Steam Frame Controller (Left)",
++                right: c"Steam Frame Controller (Right)",
++            },
++            openvr_controller_type: c"frame_controller",
++            render_model_name: Property::PerHand {
++                left: c"oculus_quest2_controller_left",
++                right: c"oculus_quest2_controller_right",
++            },
++            registered_device_type: Property::PerHand {
++                left: c"frame/controller_left",
++                right: c"frame/controller_right",
++            },
++            serial_number: Property::PerHand {
++                left: c"XRizer_Frame_Left",
++                right: c"XRizer_Frame_Right",
++            },
++            tracking_system_name: c"frame",
++            manufacturer_name: c"Valve",
++            main_axis: MainAxisType::Thumbstick,
++            // Menu, grip, A, thumbstick, trigger, squeeze, the Doom extra buttons.
++            legacy_buttons_mask: (1 << 1) | (1 << 2) | (1 << 7) | (0x0f << 8) | (7 << 32),
++        };
++        &PROPERTIES
++    }
++
++    fn legacy_bindings(c: &InputToXrPath<Self>) -> LegacyBindings {
++        LegacyBindings {
++            extra: legacy::Bindings {
++                grip_pose: c.pose(),
++            },
++            trigger: c.leftright::<Trigger, Value, _, _>(),
++            trigger_click: c.leftright::<Trigger, Value, _, _>(),
++            app_menu: Vec::new(),
++            a: c.into::<super::Right<A, Click>, _>(),
++            squeeze_click: c.leftright::<Squeeze, Value, _, _>(),
++            squeeze: c.leftright::<Squeeze, Value, _, _>(),
++            main_xy: c.leftright::<Thumbstick, (), _, _>(),
++            main_xy_click: Vec::new(),
++            main_xy_touch: c.leftright::<Thumbstick, Touch, _, _>(),
++            haptic: c.haptics(),
++        }
++    }
++
++    fn skeletal_input_bindings(c: &InputToXrPath<Self>) -> SkeletalInputBindings {
++        SkeletalInputBindings {
++            thumb_touch: c.leftright::<Thumbstick, Touch, _, _>(),
++            index_touch: c.leftright::<Trigger, Touch, _, _>(),
++            index_curl: c.leftright::<Trigger, Value, _, _>(),
++            rest_curl: c.leftright::<Squeeze, Value, _, _>(),
++        }
++    }
++
++    fn offset_grip_pose(hand: Hand) -> Mat4 {
++        // Preserve the grip alignment used by the Touch fallback in this game.
++        OculusTouch::offset_grip_pose(hand)
++    }
++}
+diff --git a/src/openxr_data.rs b/src/openxr_data.rs
+index 5fee8be..3396cfa 100644
+--- a/src/openxr_data.rs
++++ b/src/openxr_data.rs
+@@ -142,6 +142,16 @@ impl<C: Compositor> OpenXrData<C> {
+         exts.ext_view_configuration_views_change =
+             supported_exts.ext_view_configuration_views_change;
+ 
++        let frame_extension = crate::input::FRAME_CONTROLLER_EXTENSION;
++        if std::env::var("XRIZER_DOOM3_FRAME_CONTROLS").as_deref() == Ok("1")
++            && supported_exts
++                .other
++                .iter()
++                .any(|name| name == frame_extension)
++        {
++            exts.other.push(frame_extension.to_vec());
++        }
++
+         // Extension that enables simple full body tracking support via generic tracked devices.
+         // Available only in the Monado OpenXR runtime.
+         #[cfg(feature = "monado")]
